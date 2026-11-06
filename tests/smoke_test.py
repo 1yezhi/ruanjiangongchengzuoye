@@ -1,0 +1,1350 @@
+# -*- coding: utf-8 -*-
+"""自动化冒烟测试：用 Flask 测试客户端把验收标准逐条过一遍。
+
+运行：python tests/smoke_test.py
+（使用临时目录里的独立数据库，不碰 data/ 里的真实数据）
+"""
+import io
+import os
+import sqlite3
+import sys
+import tempfile
+import traceback
+from datetime import date
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE)
+
+# 必须在导入 database / app 之前把数据路径指到临时目录
+import config
+_TMP = tempfile.mkdtemp(prefix="wuye_test_")
+config.DATA_DIR = _TMP
+config.BACKUP_DIR = os.path.join(_TMP, "backups")
+config.DB_PATH = os.path.join(_TMP, "test.db")
+config.UPLOAD_DIR = os.path.join(_TMP, "uploads")   # 否则会指向真实 data/uploads，测试照片写进真实数据目录
+
+import database
+database.DB_PATH = config.DB_PATH
+
+from app import create_app
+
+TODAY = date.today()
+CUR_MONTH = TODAY.strftime("%Y-%m")
+
+PASS, FAIL = 0, []
+
+
+def check(name, cond, detail=""):
+    global PASS
+    if cond:
+        PASS += 1
+        print("  ✅ %s" % name)
+    else:
+        FAIL.append((name, detail))
+        print("  ❌ %s  %s" % (name, detail))
+
+
+def db_rows(sql, args=()):
+    con = sqlite3.connect(config.DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(sql, args).fetchall()
+    finally:
+        con.close()
+
+
+def main():
+    app = create_app()
+    app.config["TESTING"] = True
+    c = app.test_client()
+
+    # ============ 0. 空库引导 ============
+    print("\n== 空库首次使用引导 ==")
+    r = c.get("/")
+    check("空库时首页跳转到创建小区", r.status_code == 302 and "/community/add" in r.headers.get("Location", ""),
+          "%s %s" % (r.status_code, r.headers.get("Location")))
+    r = c.get("/community/add")
+    check("创建小区页面可打开", r.status_code == 200)
+
+    # ============ 1. 创建两个小区并切换 ============
+    print("\n== 小区管理 ==")
+    r = c.post("/community/add", data={"name": "阳光花园", "address": "幸福路88号",
+                                       "building_count": "2", "parking_info": "地上80个",
+                                       "delivery_date": "2021-06-30", "takeover_date": "2021-07-01",
+                                       "default_unit_price": "2.20", "remark": ""}, follow_redirects=True)
+    check("创建小区1（阳光花园）", r.status_code == 200 and "阳光花园".encode() in r.data)
+    r = c.post("/community/add", data={"name": "翡翠湾", "address": "临湖路12号"}, follow_redirects=True)
+    check("创建小区2（翡翠湾）", r.status_code == 200 and "翡翠湾".encode() in r.data)
+    r = c.get("/community/list")
+    check("小区列表显示两个小区", "阳光花园".encode() in r.data and "翡翠湾".encode() in r.data)
+
+    # 重名拦截
+    r = c.post("/community/add", data={"name": "阳光花园"}, follow_redirects=False)
+    check("小区重名被拦截", r.status_code == 302)
+    # 超长输入不崩溃
+    r = c.post("/community/add", data={"name": "超" * 300}, follow_redirects=False)
+    check("超长小区名不崩溃（友好提示）", r.status_code == 302)
+
+    # ============ 2. 楼栋 / 户型 / 批量生成 ============
+    print("\n== 楼栋与房屋（当前小区=翡翠湾，先验证隔离）==")
+    c.post("/community/switch/1", data={"next": "/"})
+    r = c.post("/building/add", data={"code": "1#", "units": "2", "floors": "5",
+                                      "has_elevator": "1", "remark": ""}, follow_redirects=True)
+    check("添加楼栋1#", "1#".encode() in r.data)
+    r = c.post("/house-type/add", data={"name": "两室两厅一卫", "rooms": "2", "halls": "2",
+                                        "baths": "1", "area": "75.5", "orientation": "南北",
+                                        "has_balcony": "1", "remark": ""}, follow_redirects=True)
+    check("添加户型", "两室两厅一卫".encode() in r.data)
+    r = c.post("/house-type/add", data={"name": "三室两厅", "rooms": "3", "halls": "2",
+                                        "baths": "2", "area": "105", "orientation": "南"}, follow_redirects=True)
+    tid = db_rows("SELECT id FROM house_type WHERE name='三室两厅'")[0]["id"]
+
+    print("\n== 批量生成房屋（2单元×5层×每层2户=20套）==")
+    r = c.post("/house/batch", data={"building_id": "1", "units": "2", "floors": "5",
+                                     "per_floor": "2", "house_type_id": str(tid), "area": "100"},
+               follow_redirects=True)
+    check("批量生成成功", "新建 20 套".encode() in r.data)
+    n = db_rows("SELECT COUNT(*) AS n FROM house")[0]["n"]
+    check("数据库中 20 套房屋", n == 20, "实际 %d" % n)
+    r = c.post("/house/batch", data={"building_id": "1", "units": "2", "floors": "5",
+                                     "per_floor": "2", "area": "100"}, follow_redirects=True)
+    check("重复批量生成全部跳过", "跳过已存在的 20 套".encode() in r.data)
+    # 房号编码检查
+    row = db_rows("""SELECT b.code, h.unit, h.floor, h.room_no FROM house h
+                     JOIN building b ON b.id=h.building_id
+                     ORDER BY b.id, h.unit, h.floor, h.room_no LIMIT 1""")[0]
+    check("房号自动编号（101 起）", row["room_no"] == 101, str(dict(row)))
+
+    # ============ 3. 小区数据隔离 ============
+    print("\n== 小区切换与数据隔离 ==")
+    c.post("/community/switch/2", data={"next": "/"})
+    r = c.get("/house")
+    check("切换到翡翠湾后房屋列表为空", "共 0 套房屋".encode() in r.data)
+    r = c.get("/building")
+    check("翡翠湾没有楼栋", "共 0 栋楼".encode() in r.data)
+    c.post("/community/switch/1", data={"next": "/"})
+    r = c.get("/house")
+    check("切回阳光花园房屋仍在", "共 20 套房屋".encode() in r.data)
+
+    # ============ 4. 单套新增房屋 + 重复拦截 ============
+    print("\n== 单套新增房屋 ==")
+    r = c.post("/house/add", data={"building_id": "1", "unit": "1", "floor": "5", "room_no": "503",
+                                   "area": "120", "inner_area": "98", "house_type_id": str(tid),
+                                   "status": "self", "occupied_date": "2022-01-01",
+                                   "owner_mode": "new", "owner_name": "张三", "owner_phone": "13812345678",
+                                   "remark": "顶楼"}, follow_redirects=True)
+    check("新增房屋并登记业主", "张三".encode() in r.data)
+    r = c.post("/house/add", data={"building_id": "1", "unit": "1", "floor": "6", "room_no": "601",
+                                   "status": "self", "owner_mode": "none"}, follow_redirects=False)
+    check("超出楼栋层数的房屋被拦截", r.status_code == 302)
+    r = c.post("/house/add", data={"building_id": "1", "unit": "1", "floor": "5", "room_no": "503",
+                                   "status": "self", "owner_mode": "none"}, follow_redirects=False)
+    check("重复房号被拦截", r.status_code == 302)
+
+    houses = db_rows("SELECT id, room_no FROM house ORDER BY id")
+    hid_main = houses[-1]["id"]         # 新加的 1-5-503（业主=张三）
+    hid_payall = houses[3]["id"]
+    hid_void = houses[4]["id"]
+
+    # ============ 5. 住户：业主已有，加 2 名家庭成员 + 1 名租户 ============
+    print("\n== 住户登记（1 业主 + 2 成员 + 1 租户）==")
+    for rel, name, phone in (("配偶", "李四", "13812345679"), ("子女", "张小明", "")):
+        r = c.post("/resident/add", data={
+            "house_id": str(hid_main), "role": "member", "name": name, "gender": "女",
+            "birth_date": "1985-05-01", "id_number": "", "phone": phone,
+            "relation": rel, "is_living": "1", "start_date": "2022-01-01"}, follow_redirects=False)
+        check("添加家庭成员 %s" % name, r.status_code == 302 and b"resident" not in r.headers.get("Location", "").encode())
+    r = c.post("/resident/add", data={
+        "house_id": str(hid_main), "role": "tenant", "name": "王五", "phone": "13812345680",
+        "start_date": "2026-01-01", "lease_start": "2026-01-01",
+        "lease_end": (TODAY.replace(day=1).isoformat() if False else "2027-01-01"),
+        "monthly_rent": "2000"}, follow_redirects=True)
+    check("添加租户", "王五".encode() in r.data)
+    r = c.get("/house/%d" % hid_main)
+    check("房屋详情显示 4 名住户", "王五".encode() in r.data and "李四".encode() in r.data
+          and "张三".encode() in r.data and "张小明".encode() in r.data)
+
+    # 手机号/身份证校验
+    r = c.post("/resident/add", data={"house_id": str(hid_main), "role": "member", "name": "赵六",
+                                      "phone": "123", "relation": "其他"}, follow_redirects=False)
+    check("手机号位数不对被拦截", r.status_code == 302)
+    bad_id = "11010119900101123X"     # 校验位错误
+    r = c.post("/resident/add", data={"house_id": str(hid_main), "role": "member", "name": "赵六",
+                                      "id_number": bad_id}, follow_redirects=False)
+    check("身份证校验位错误被拦截", r.status_code == 302)
+    # 第二个业主拦截
+    r = c.post("/resident/add", data={"house_id": str(hid_main), "role": "owner", "name": "测试"},
+               follow_redirects=False)
+    check("重复登记业主被拦截", r.status_code == 302)
+    # 搬出一名成员 → 历史时间线
+    link = db_rows("SELECT id FROM resident_house WHERE role='member' LIMIT 1")[0]["id"]
+    r = c.post("/resident/%d/move-out" % link, follow_redirects=True)
+    check("成员搬出转历史", "历史住户".encode() in r.data)
+    r = c.get("/house/%d" % hid_main)
+    check("历史时间线显示已搬出", "已搬出".encode() in r.data)
+
+    # ============ 6. 收费项目与账单生成 ============
+    print("\n== 收费项目与生成账单 ==")
+    r = c.post("/fee/items/add", data={"name": "物业费", "pricing_mode": "area",
+                                       "unit_price": "2.20", "cycle": "month", "remark": ""},
+               follow_redirects=True)
+    check("添加收费项目 物业费(2.2元/㎡/月)", "物业费".encode() in r.data)
+    r = c.post("/fee/items/add", data={"name": "公摊水电费", "pricing_mode": "fixed",
+                                       "unit_price": "15.00", "cycle": "month"}, follow_redirects=True)
+    check("添加收费项目 公摊水电费(15元/户/月)", "公摊水电费".encode() in r.data)
+    f1 = db_rows("SELECT id FROM fee_item WHERE name='物业费'")[0]["id"]
+    f2 = db_rows("SELECT id FROM fee_item WHERE name='公摊水电费'")[0]["id"]
+
+    r = c.post("/fee/generate", data={"fee_item_id": str(f1), "period": CUR_MONTH,
+                                      "building_id": "", "status_scope": "all"})
+    check("生成预览页可打开", r.status_code == 200 and "第 2 步".encode() in r.data)
+    r = c.post("/fee/generate/confirm", data={"fee_item_id": str(f1), "period": CUR_MONTH,
+                                              "building_id": "0", "status_scope": "all"},
+               follow_redirects=True)
+    check("生成物业费账单 21 笔", "共 21 笔".encode() in r.data)
+    r = c.post("/fee/generate/confirm", data={"fee_item_id": str(f2), "period": CUR_MONTH,
+                                              "building_id": "0", "status_scope": "all"},
+               follow_redirects=True)
+    check("生成公摊账单 21 笔", "共 21 笔".encode() in r.data)
+    r = c.post("/fee/generate/confirm", data={"fee_item_id": str(f1), "period": CUR_MONTH,
+                                              "building_id": "0", "status_scope": "all"},
+               follow_redirects=False)
+    check("同账期重复生成被提示无需生成", r.status_code == 302)
+    # 金额核算：100㎡ × 2.2 = 220 元；公摊 15 元
+    amt = db_rows("SELECT amount_receivable FROM bill WHERE fee_item_id=?", (f1,))[0]["amount_receivable"]
+    check("物业费金额=220.00元（整数分存储）", amt == 22000, str(amt))
+    amt2 = db_rows("SELECT amount_receivable FROM bill WHERE fee_item_id=?", (f2,))[0]["amount_receivable"]
+    check("公摊金额=15.00元", amt2 == 1500, str(amt2))
+
+    # ============ 7. 部分缴费 + 全额缴费 + 状态流转 ============
+    print("\n== 缴费与状态流转 ==")
+    bill = db_rows("""SELECT b.id, b.amount_receivable FROM bill b
+                      JOIN house h ON h.id=b.house_id
+                      WHERE b.fee_item_id=? AND h.room_no=101 ORDER BY b.id LIMIT 1""", (f1,))[0]
+    r = c.post("/fee/bill/%d/pay" % bill["id"], data={"amount": "100.00", "pay_date": TODAY.isoformat(),
+                                                      "method": "现金", "receipt_no": "SK001"},
+               follow_redirects=True)
+    check("部分缴费 100 元", r.status_code == 200)
+    st = db_rows("SELECT status, amount_received FROM bill WHERE id=?", (bill["id"],))[0]
+    check("状态变为部分缴纳", st["status"] == "partial" and st["amount_received"] == 10000,
+          "%s %s" % (st["status"], st["amount_received"]))
+    r = c.post("/fee/bill/%d/pay" % bill["id"], data={"amount": "999", "pay_date": TODAY.isoformat(),
+                                                      "method": "现金"}, follow_redirects=False)
+    check("超额缴费被拦截", r.status_code == 302)
+    r = c.post("/fee/bill/%d/pay" % bill["id"], data={"amount": "120.00", "pay_date": TODAY.isoformat(),
+                                                      "method": "转账"}, follow_redirects=True)
+    st = db_rows("SELECT status, amount_received FROM bill WHERE id=?", (bill["id"],))[0]
+    check("补齐后状态变为已缴清", st["status"] == "paid" and st["amount_received"] == 22000)
+
+    # 一键缴清（多张账单合并收款）
+    r = c.get("/fee/house/%d/payall" % hid_payall)
+    check("一键缴清页可打开", r.status_code == 200)
+    r = c.post("/fee/house/%d/payall" % hid_payall,
+               data={"bill_ids": [str(b["id"]) for b in db_rows(
+                   "SELECT id FROM bill WHERE house_id=? AND status IN ('unpaid','partial')", (hid_payall,))],
+                   "total_amount": "235.00", "pay_date": TODAY.isoformat(), "method": "扫码"},
+               follow_redirects=True)
+    st = db_rows("SELECT COUNT(*) AS n FROM bill WHERE house_id=? AND status='paid'", (hid_payall,))[0]["n"]
+    check("合并收款后该房 2 笔账单全部缴清", st == 2, "已缴清 %d 笔" % st)
+
+    # 调整金额（留痕）
+    bill_v = db_rows("SELECT id, amount_receivable FROM bill WHERE house_id=? AND fee_item_id=?",
+                     (hid_void, f1))[0]
+    r = c.post("/fee/bill/%d/adjust" % bill_v["id"], data={"new_amount": "200.00", "reason": "空置房减免"},
+               follow_redirects=True)
+    r = c.get("/fee/bill/%d" % bill_v["id"])
+    check("金额调整留痕（原因可查）", "空置房减免".encode() in r.data)
+    # 调整必须填原因
+    r = c.post("/fee/bill/%d/adjust" % bill_v["id"], data={"new_amount": "100.00", "reason": ""},
+               follow_redirects=False)
+    check("调整不填原因被拦截", r.status_code == 302)
+    # 作废
+    r = c.post("/fee/bill/%d/void" % bill_v["id"], follow_redirects=True)
+    st = db_rows("SELECT status FROM bill WHERE id=?", (bill_v["id"],))[0]["status"]
+    check("账单作废成功", st == "void")
+
+    # ============ 7.5 0 元账单（免收 / 减免到 0）状态判定 ============
+    print("\n== 0 元账单（免收）判定 ==")
+    from services import fee_service as _fee_service
+
+    def _overdue_ids(cid):
+        con_o = sqlite3.connect(config.DB_PATH)
+        con_o.row_factory = sqlite3.Row
+        try:
+            return {r["bill_id"] for r in _fee_service.overdue_rows(con_o, cid)}
+        finally:
+            con_o.close()
+
+    # ① 单价 0 元的收费项目：生成的账单应当就是「已缴清」，且不进欠费名单
+    c.post("/fee/items/add", data={"name": "免收测试费", "pricing_mode": "fixed",
+                                   "unit_price": "0", "cycle": "month"}, follow_redirects=True)
+    f0 = db_rows("SELECT id FROM fee_item WHERE name='免收测试费'")[0]["id"]
+    c.post("/fee/generate/confirm", data={"fee_item_id": str(f0), "period": CUR_MONTH,
+                                          "building_id": "0", "status_scope": "all"},
+           follow_redirects=True)
+    nh = db_rows("SELECT COUNT(*) AS n FROM house WHERE community_id=1")[0]["n"]
+    n0 = db_rows("SELECT COUNT(*) AS n FROM bill WHERE fee_item_id=?", (f0,))[0]["n"]
+    check("0 元收费项目可批量生成账单", n0 == nh, "生成 %d 笔 / 房屋 %d 套" % (n0, nh))
+    st0 = sorted({x["status"] for x in db_rows("SELECT status FROM bill WHERE fee_item_id=?", (f0,))})
+    check("0 元账单生成即为「已缴清」", st0 == ["paid"], str(st0))
+    zero_ids = {x["id"] for x in db_rows("SELECT id FROM bill WHERE fee_item_id=?", (f0,))}
+    owed0 = _overdue_ids(1)
+    check("0 元账单不进欠费名单", not (zero_ids & owed0), "交集 %d 笔" % len(zero_ids & owed0))
+
+    # ② 先有金额、后减免到 0：经「调整金额」重算后也应变成「已缴清」且不再欠费
+    hid_zero = db_rows("SELECT id FROM house WHERE community_id=1 AND room_no=102 LIMIT 1")[0]["id"]
+    con_z = sqlite3.connect(config.DB_PATH)
+    con_z.execute("""INSERT INTO bill (house_id, fee_item_id, period, period_start, months,
+                                       amount_receivable, amount_received)
+                     VALUES (?,?,'减免测试期','2020-01',12,10000,0)""", (hid_zero, f1))
+    con_z.commit()
+    b_adj = con_z.execute("SELECT id FROM bill WHERE house_id=? AND period='减免测试期'",
+                          (hid_zero,)).fetchone()[0]
+    con_z.close()
+    check("减免前该账单为「未缴」（前置条件）",
+          db_rows("SELECT status FROM bill WHERE id=?", (b_adj,))[0]["status"] == "unpaid")
+    c.post("/fee/bill/%d/adjust" % b_adj, data={"new_amount": "0.00", "reason": "业主免收物业费"},
+           follow_redirects=True)
+    st_b = db_rows("SELECT status, amount_receivable FROM bill WHERE id=?", (b_adj,))[0]
+    check("减免到 0 元后状态变为「已缴清」",
+          st_b["status"] == "paid" and st_b["amount_receivable"] == 0,
+          "status=%s 应收=%s" % (st_b["status"], st_b["amount_receivable"]))
+    check("减免到 0 后不再计入欠费", b_adj not in _overdue_ids(1))
+
+    # ③ 回归：正金额且未收款，经同样的重算路径仍应判「未缴」
+    b_reg = db_rows("""SELECT id, amount_receivable FROM bill
+                       WHERE fee_item_id=? AND status='unpaid' LIMIT 1""", (f1,))[0]
+    c.post("/fee/bill/%d/adjust" % b_reg["id"],
+           data={"new_amount": "%.2f" % (b_reg["amount_receivable"] / 100.0), "reason": "回归校验"},
+           follow_redirects=True)
+    st_r = db_rows("SELECT status FROM bill WHERE id=?", (b_reg["id"],))[0]["status"]
+    check("正金额未收款账单仍判「未缴」（回归）", st_r == "unpaid", st_r)
+
+    # ============ 8. 欠费清单与报表数字核算 ============
+    print("\n== 欠费清单与报表核算 ==")
+    # 20 套×22000（100㎡×2.2）+ 新增 1 套 26400（120㎡×2.2）+ 21 套公摊×1500
+    # 减：调整 -2000；作废账单 20000（作废后不计应收）
+    expected_recv = 20 * 22000 + 26400 + 21 * 1500 - 2000 - 20000
+    expected_got = 22000 + 23500                       # 101室全额 + payall 房
+    void_amt = db_rows("SELECT amount_receivable FROM bill WHERE status='void'")[0]["amount_receivable"]
+    check("作废账单的调整已生效（22000→20000）", void_amt == 20000, str(void_amt))
+    row = db_rows("""
+        SELECT COALESCE(SUM(amount_receivable),0) recv, COALESCE(SUM(amount_received),0) got
+        FROM bill b JOIN house h ON h.id=b.house_id
+        WHERE h.community_id=1 AND b.status!='void'""")[0]
+    check("欠费报表：应收合计与手工核算一致", row["recv"] == expected_recv,
+          "库 %d / 算 %d" % (row["recv"], expected_recv))
+    check("报表：实收合计与手工核算一致", row["got"] == expected_got,
+          "库 %d / 算 %d" % (row["got"], expected_got))
+    rate = round(row["got"] * 100 / row["recv"])
+    r = c.get("/report?mode=month&month=%s&scope=current" % CUR_MONTH)
+    check("报表页显示收缴率 %d%%" % rate, ("%d%%" % rate).encode() in r.data)
+    r = c.get("/fee/overdue")
+    check("欠费管理页可打开且显示欠费", r.status_code == 200 and "欠费总额".encode() in r.data)
+    hid_sms = db_rows("""SELECT DISTINCT house_id FROM bill WHERE status='unpaid' LIMIT 1""")[0]["house_id"]
+    r = c.get("/fee/overdue/sms/%d" % hid_sms)
+    check("催缴短信生成", r.status_code == 200 and b"\\u7269\\u4e1a" in r.data.replace(b" ", b""))
+
+    # ============ 9. 全局搜索 / 导出 ============
+    print("\n== 搜索与导出 ==")
+    r = c.get("/resident?keyword=张三")
+    check("全局搜索住户（按姓名）", "张三".encode() in r.data)
+    r = c.get("/resident?keyword=13812345680")
+    check("全局搜索住户（按手机号）", "王五".encode() in r.data)
+    r = c.get("/resident/export")
+    check("通讯录 CSV 带 BOM（Excel 不乱码）", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf"))
+    r = c.get("/fee/overdue/export")
+    check("催缴名单 CSV 可导出", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf"))
+    r = c.get("/fee/payments/export")
+    check("缴费流水 CSV 可导出", r.status_code == 200)
+
+    # ============ 10. 产权过户 ============
+    print("\n== 产权过户 ==")
+    r = c.post("/house/%d/transfer" % hid_main, data={"transfer_date": TODAY.isoformat(),
+                                                      "owner_mode": "new", "owner_name": "新业主",
+                                                      "owner_phone": "13999999999"}, follow_redirects=True)
+    check("过户成功提示", "产权过户完成".encode() in r.data)
+    r = c.get("/house/%d" % hid_main)
+    check("旧业主进历史、新业主生效", "新业主".encode() in r.data and "已搬出".encode() in r.data)
+
+    # ============ 11. 报修 ============
+    print("\n== 报修登记 ==")
+    r = c.post("/repair/add", data={"house_id": str(hid_main), "content": "厨房漏水"}, follow_redirects=True)
+    check("新增报修", "厨房漏水".encode() in r.data)
+    rid = db_rows("SELECT id FROM repair LIMIT 1")[0]["id"]
+    c.post("/repair/%d/status" % rid, data={"action": "start"})
+    c.post("/repair/%d/status" % rid, data={"action": "finish"})
+    st = db_rows("SELECT status FROM repair WHERE id=?", (rid,))[0]["status"]
+    check("报修状态流转到已完成", st == "done")
+
+    # ============ 12. 备份与恢复 ============
+    print("\n== 备份与恢复 ==")
+    r = c.get("/settings/backup")
+    check("备份数据可下载", r.status_code == 200 and ".db" in r.headers.get("Content-Disposition", ""))
+    backup_bytes = r.data
+    # 做一些“之后的变化”，再用备份恢复回去
+    c.post("/community/add", data={"name": "恢复测试专用小区"})
+    n_new = db_rows("SELECT COUNT(*) AS n FROM community WHERE name='恢复测试专用小区'")[0]["n"]
+    check("备份后新增了一个小区", n_new == 1)
+    r = c.post("/settings/restore", data={"file": (io.BytesIO(backup_bytes), "物业数据备份.db")},
+               content_type="multipart/form-data", follow_redirects=True)
+    check("恢复数据成功", "数据恢复成功".encode() in r.data)
+    n_new = db_rows("SELECT COUNT(*) AS n FROM community WHERE name='恢复测试专用小区'")[0]["n"]
+    n_sun = db_rows("SELECT COUNT(*) AS n FROM community WHERE name='阳光花园'")[0]["n"]
+    check("恢复后新小区消失、原小区回来", n_new == 0 and n_sun == 1)
+    # 换目录恢复：备份文件放到新目录，用 fresh 连接打开并校验数据完整
+    tmp2 = tempfile.mkdtemp(prefix="wuye_restore_")
+    with open(os.path.join(tmp2, "backup.db"), "wb") as f:
+        f.write(backup_bytes)
+    con = sqlite3.connect(os.path.join(tmp2, "backup.db"))
+    n = con.execute("SELECT COUNT(*) FROM house").fetchone()[0]
+    con.close()
+    check("备份文件在任意目录可独立打开（换电脑迁移）", n == 21, "房屋数 %d" % n)
+    # 恢复非 db 文件被拦截
+    r = c.post("/settings/restore", data={"file": (io.BytesIO(b"hello"), "x.db")},
+               content_type="multipart/form-data", follow_redirects=False)
+    check("伪备份文件被识别拦截", r.status_code == 302)
+
+    # ============ 13. 演示数据载入/清空 ============
+    print("\n== 演示数据 ==")
+    r = c.post("/settings/demo/load", follow_redirects=True)
+    check("演示数据载入", "演示数据已载入".encode() in r.data)
+    n = db_rows("SELECT COUNT(*) AS n FROM community WHERE is_demo=1")[0]["n"]
+    check("载入了 2 个演示小区", n == 2, str(n))
+    n_res = db_rows("SELECT COUNT(*) AS n FROM resident")[0]["n"]
+    check("演示住户超过 20 人", n_res >= 20, str(n_res))
+    r = c.post("/settings/demo/clear", follow_redirects=True)
+    check("一键清空演示数据", "演示数据已清空".encode() in r.data)
+    n = db_rows("SELECT COUNT(*) AS n FROM community WHERE is_demo=1")[0]["n"]
+    check("清空后演示小区为 0", n == 0)
+    n_sun = db_rows("SELECT COUNT(*) AS n FROM community WHERE name='阳光花园'")[0]["n"]
+    check("清空演示数据不影响真实小区", n_sun == 1)
+
+    # ============ 14. 乱输入轰炸（都不能 500）============
+    print("\n== 乱输入轰炸 ==")
+    fuzz_cases = [
+        ("POST", "/community/add", {"name": "x", "building_count": "abc"}),
+        ("POST", "/community/add", {"name": "-" * 5, "default_unit_price": "-3"}),
+        ("GET", "/house?building_id=abc&unit=xyz", None),
+        ("GET", "/fee/bills?fee_item_id=abc&building_id=xyz", None),
+        ("GET", "/fee/payments?fee_item_id=abc&date_from=not-a-date", None),
+        ("POST", "/fee/generate/confirm", {"fee_item_id": "abc", "period": "garbage"}),
+        ("POST", "/fee/bill/99999/pay", {"amount": "abc", "pay_date": "2026-13-40"}),
+        ("POST", "/fee/bill/%d/pay" % bill["id"], {"amount": "-5.00", "pay_date": "2026-01-01"}),
+        ("POST", "/fee/bill/%d/pay" % bill["id"], {"amount": "1.999", "pay_date": "2026-01-01"}),
+        ("GET", "/house/99999", None),
+        ("GET", "/fee/bill/99999", None),
+        ("POST", "/resident/add", {"house_id": "99999", "role": "member", "name": "测试"}),
+        ("POST", "/resident/add", {"house_id": "abc", "role": "member", "name": "测试"}),
+        ("POST", "/house/batch", {"building_id": "99999", "units": "2", "floors": "5", "per_floor": "2"}),
+        ("POST", "/house/batch", {"building_id": "1", "units": "999", "floors": "-5", "per_floor": "2"}),
+        ("POST", "/community/switch/99999", {}),
+        ("POST", "/fee/house/%d/payall" % hid_main, {"bill_ids": ["99999", "abc"], "total_amount": "1"}),
+        ("POST", "/fee/items/add", {"name": "x" * 500, "unit_price": "abc"}),
+        ("POST", "/fee/items/add", {"name": "物业费", "unit_price": "0.00"}),
+        ("GET", "/resident?keyword=<script>alert(1)</script>", None),
+        ("POST", "/settings/demo/load", {}),      # 已清空后可再次载入，不算错；这里主要验证不崩
+        ("POST", "/repair/add", {"content": ""}),
+        ("GET", "/不存在的页面", None),
+        ("POST", "/staff/add", {"name": "超" * 100}),
+        ("GET", "/staff/99999", None),
+        ("GET", "/staff/report?year=abc", None),
+        ("GET", "/staff/salary?year=xxx&month=99", None),
+        ("POST", "/staff/salary/save", {"year": "xx", "month": "1"}),
+        ("GET", "/staff/social?year=abc", None),
+    ]
+    ok = True
+    for method, url, data in fuzz_cases:
+        try:
+            r = c.open(url, method=method, data=data, follow_redirects=True)
+            if r.status_code >= 500:
+                ok = False
+                print("    💥 500: %s %s" % (method, url))
+        except Exception as e:
+            ok = False
+            print("    💥 异常: %s %s -> %s" % (method, url, e))
+    check("全部乱输入都不崩溃（无 500）", ok)
+    r = c.get("/")
+    check("轰炸后首页仍正常", r.status_code == 200)
+
+    # ============ 15. 重启数据不丢失 ============
+    print("\n== 重启程序数据不丢失 ==")
+    app2 = create_app()      # 模拟关掉窗口重新启动
+    c2 = app2.test_client()
+    r = c2.get("/house")
+    check("重启后房屋数据仍在", "共 21 套房屋".encode() in r.data)
+    r = c2.get("/resident?keyword=王五")
+    check("重启后住户数据仍在", "王五".encode() in r.data)
+
+    # ============ 15.5 端口占用自动顺延（Windows 兼容）============
+    print("\n== 端口占用自动顺延 ==")
+    import socket as _socket
+    from app import _pick_port
+    blocker = _socket.socket()
+    blocker.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)   # 模拟另一个物业管家实例
+    blocker.bind(("0.0.0.0", 5998))
+    blocker.listen(1)
+    picked = _pick_port(5998)
+    check("端口被占用时自动换下一个", picked is not None and picked != 5998, str(picked))
+    # 把 6019~6039 全部占住，_pick_port 应返回 None
+    blockers = []
+    for p in range(6019, 6040):
+        b = _socket.socket()
+        b.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            b.bind(("0.0.0.0", p))
+            b.listen(1)
+            blockers.append(b)
+        except OSError:
+            b.close()      # 已被系统占用也无所谓，效果相同
+    check("全部端口被占时返回 None", _pick_port(6019) is None)
+    for b in blockers:
+        b.close()
+    blocker.close()
+
+    # ============ 16. 名册导入与车辆管理 ============
+    print("\n== 名册导入与车辆管理 ==")
+    import json as _json
+    from services import house_import as _hi
+    id17 = "11010119900307777"
+    good_id = id17 + __import__("sys").modules["utils"].idcard_check_digit(id17)
+    csv_lines = [
+        "栋编号,单元,房号,建筑面积,车位号,业主姓名,业主电话,业主证件号,业主性别,业主工作单位,家庭成员,租户,车辆,备注",
+        "9,1,1,89.50,12东,钱测试,13800009001,,男,测试单位,孙测试|13800009002||配偶,周租户|13800009003,京A99999|地下9号,导入测试",
+        "9,1,2,75.20,,吴测试,13800009004,{},女,,,".format(good_id),
+        "9,2,1,99.00,,錯测试,x,y,,",   # 坏行：电话/证件号非法 → 应被拦截
+    ]
+    csv_bytes = ("\n".join(csv_lines)).encode("gbk")     # 顺带验证 GBK 编码兼容
+    r = c2.post("/house/import/preview", data={"file": (io.BytesIO(csv_bytes), "名册.csv")},
+                content_type="multipart/form-data")
+    html = r.data.decode("utf-8")
+    check("名册导入预览可打开", r.status_code == 200 and "预览确认" in html)
+    check("坏行被拦截并提示", "必须全部修正" in html and "1 个问题" in html)
+    # 去掉坏行后确认导入
+    rows = _hi.read_import_csv(("\n".join(csv_lines[:-1])).encode("utf-8-sig"))
+    payload = _json.dumps(rows, ensure_ascii=False)
+    r = c2.post("/house/import/confirm", data={"payload": payload}, follow_redirects=True)
+    check("导入成功提示", "导入完成" in r.data.decode("utf-8"))
+    n_house = db_rows("SELECT COUNT(*) AS n FROM house WHERE community_id=1 AND building_id IN "
+                      "(SELECT id FROM building WHERE code='9#')")[0]["n"]
+    check("导入新建 2 套房屋", n_house == 2, str(n_house))
+    r = c2.get("/resident?keyword=钱测试")
+    check("导入的业主可搜索", "钱测试".encode() in r.data)
+    hid_imp = db_rows("SELECT h.id FROM house h JOIN building b ON b.id=h.building_id "
+                      "WHERE b.code='9#' AND h.room_no=1")[0]["id"]
+    r = c2.get("/house/%d" % hid_imp)
+    check("房屋详情显示车位号", "12东".encode() in r.data)
+    check("房屋详情显示车辆", "京A99999".encode() in r.data)
+    check("家庭成员已导入", "孙测试".encode() in r.data and "配偶".encode() in r.data)
+    check("租户已导入且状态变为出租", "周租户".encode() in r.data)
+    st = db_rows("SELECT status FROM house WHERE id=?", (hid_imp,))[0]["status"]
+    check("有租户的房屋状态=出租", st == "rent", st)
+    # 重复导入：不应重复登记业主/车辆
+    r = c2.post("/house/import/confirm", data={"payload": payload}, follow_redirects=True)
+    n_owner = db_rows("""SELECT COUNT(*) AS n FROM resident_house rh WHERE rh.house_id=? AND rh.role='owner'
+                         AND rh.is_current=1""", (hid_imp,))[0]["n"]
+    n_car = db_rows("SELECT COUNT(*) AS n FROM vehicle WHERE house_id=?", (hid_imp,))[0]["n"]
+    check("重复导入不产生重复业主/车辆", n_owner == 1 and n_car == 1,
+          "业主 %d 车 %d" % (n_owner, n_car))
+    # 车辆登记/删除
+    r = c2.post("/house/%d/vehicle/add" % hid_imp, data={"plate": "京B88888", "vehicle_remark": "测试"},
+                follow_redirects=True)
+    check("手工登记车辆", "京B88888".encode() in r.data)
+    vid = db_rows("SELECT id FROM vehicle WHERE plate='京B88888'")[0]["id"]
+    r = c2.post("/house/vehicle/%d/delete" % vid, follow_redirects=True)
+    check("删除车辆登记", "京B88888".encode() not in r.data)
+
+    # 停车费账单关联车辆（车辆卡片显示缴纳情况）
+    r = c2.post("/fee/items/add", data={"name": "停车费", "pricing_mode": "fixed",
+                                        "unit_price": "20", "cycle": "month"}, follow_redirects=True)
+    fid_park = db_rows("SELECT id FROM fee_item WHERE name='停车费'")[0]["id"]
+    vid = db_rows("SELECT id FROM vehicle WHERE house_id=? AND plate='京A99999'", (hid_imp,))[0]["id"]
+    con_t = sqlite3.connect(config.DB_PATH)
+    con_t.execute("""INSERT INTO bill (house_id, fee_item_id, vehicle_id, period, period_start,
+        months, amount_receivable, amount_received, status)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (hid_imp, fid_park, vid, "2026.1-2026.12[京A99999]", "2026-01", 12, 24000, 24000, "paid"))
+    con_t.commit(); con_t.close()
+    r = c2.get("/house/%d" % hid_imp)
+    html2 = r.data.decode("utf-8")
+    check("车辆卡片显示停车费缴纳情况", "2026.1-2026.12" in html2 and "缴至" in html2)
+    check("显示缴至月份", "2026-12" in html2)
+
+    # ============ 17. 人员管理模块 ============
+    from services import staff_service as staff_service_import
+    print("\n== 人员管理：员工档案 ==")
+    id17s = "11010119850505123"
+    good_id_staff = id17s + __import__("sys").modules["utils"].idcard_check_digit(id17s)
+    r = c2.post("/staff/add", data={
+        "name": "员测试", "gender": "男", "birth_date": "1985-05-05", "id_number": good_id_staff,
+        "phone": "13800009901", "department": "秩序", "position": "保安队长",
+        "community_id": "1", "hire_date": "2024-03-01", "leave_date": "",
+        "status": "active", "contract_end": "2026-12-31", "cert_name": "", "cert_end": "",
+        "emergency_name": "急联系人", "emergency_phone": "13800009902", "address": "", "remark": ""},
+        follow_redirects=True)
+    check("新增员工", "员测试".encode() in r.data)
+    sid_staff = db_rows("SELECT id FROM staff WHERE name='员测试'")[0]["id"]
+    r = c2.get("/staff/%d" % sid_staff)
+    check("员工详情显示年龄（自动计算）", "41 岁".encode() in r.data or "40 岁".encode() in r.data)
+    r = c2.post("/staff/add", data={"name": "坏证件员工", "id_number": "11010119900101123X"},
+                follow_redirects=False)
+    check("身份证校验位错误被拦截", r.status_code == 302)
+    r = c2.post("/staff/%d/edit" % sid_staff, data={
+        "name": "员测试", "gender": "男", "birth_date": "1985-05-05", "id_number": good_id_staff,
+        "phone": "13800009901", "department": "秩序", "position": "保安队长", "community_id": "1",
+        "hire_date": "2024-03-01", "leave_date": "2020-01-01", "status": "active"},
+        follow_redirects=False)
+    check("离职日期早于入职日期被拦截", r.status_code == 302)
+
+    print("\n== 人员管理：社保与工资批量录入 ==")
+    # 先录 2026 年 1 月社保（个人养老 8000 分 + 个人医疗 2000 分 = 100 元）
+    c2.get("/staff/social?year=2026&month=1")
+    r = c2.post("/staff/social/save", data={
+        "year": "2026", "month": "1", "staff_ids": [str(sid_staff)],
+        "base_%d" % sid_staff: "4000.00",
+        "co_pension_%d" % sid_staff: "640.00", "co_medical_%d" % sid_staff: "320.00",
+        "co_unemployment_%d" % sid_staff: "20.00", "co_injury_%d" % sid_staff: "16.00",
+        "co_maternity_%d" % sid_staff: "16.00", "co_fund_%d" % sid_staff: "400.00",
+        "personal_pension_%d" % sid_staff: "80.00", "personal_medical_%d" % sid_staff: "20.00",
+        "personal_unemployment_%d" % sid_staff: "", "personal_fund_%d" % sid_staff: "200.00",
+        "remark_%d" % sid_staff: ""}, follow_redirects=True)
+    soc = db_rows("SELECT * FROM staff_social WHERE staff_id=?", (sid_staff,))[0]
+    check("社保批量录入成功", soc["base"] == 400000 and soc["co_pension"] == 64000)
+    # 工资批量录入：社保个人代扣应自动带出 100 元（80+20+0）
+    r = c2.get("/staff/salary?year=2026&month=1")
+    check("工资录入页自动带出社保个人代扣", b"100.00" in r.data)
+    r = c2.post("/staff/salary/save", data={
+        "year": "2026", "month": "1", "staff_ids": [str(sid_staff)],
+        "base_%d" % sid_staff: "3000.00", "allowance_%d" % sid_staff: "500.00",
+        "overtime_%d" % sid_staff: "200.00", "subsidy_%d" % sid_staff: "100.00",
+        "social_deduct_%d" % sid_staff: "100.00", "social_auto_%d" % sid_staff: "100.00",
+        "tax_%d" % sid_staff: "30.00", "other_deduct_%d" % sid_staff: "20.00",
+        "pay_date_%d" % sid_staff: "2026-02-10", "method_%d" % sid_staff: "转账",
+        "remark_%d" % sid_staff: ""}, follow_redirects=True)
+    sal = db_rows("SELECT * FROM staff_salary WHERE staff_id=?", (sid_staff,))[0]
+    gross = sal["base"] + sal["allowance"] + sal["overtime"] + sal["subsidy"]
+    net = gross - sal["social_deduct"] - sal["tax"] - sal["other_deduct"]
+    check("工资应发自动计算（3800 元）", gross == 380000, str(gross))
+    check("工资实发自动计算（3650 元）", net == 365000, str(net))
+    # 社保代扣覆盖必须填原因
+    r = c2.post("/staff/salary/save", data={
+        "year": "2026", "month": "1", "staff_ids": [str(sid_staff)],
+        "base_%d" % sid_staff: "3000.00", "social_deduct_%d" % sid_staff: "50.00",
+        "social_auto_%d" % sid_staff: "100.00", "override_reason_%d" % sid_staff: "",
+        "tax_%d" % sid_staff: "", "other_deduct_%d" % sid_staff: ""}, follow_redirects=False)
+    check("社保代扣覆盖不填原因被拦截", r.status_code == 302)
+    # 重复保存 = 覆盖更新，不产生重复记录
+    r = c2.post("/staff/salary/save", data={
+        "year": "2026", "month": "1", "staff_ids": [str(sid_staff)],
+        "base_%d" % sid_staff: "3000.00", "social_deduct_%d" % sid_staff: "50.00",
+        "social_auto_%d" % sid_staff: "100.00", "override_reason_%d" % sid_staff: "离职折算",
+        "tax_%d" % sid_staff: "", "other_deduct_%d" % sid_staff: ""}, follow_redirects=True)
+    n_sal = db_rows("SELECT COUNT(*) AS n FROM staff_salary WHERE staff_id=?", (sid_staff,))[0]["n"]
+    check("同月重复保存只保留一条", n_sal == 1, str(n_sal))
+    check("覆盖原因已留痕", db_rows("SELECT override_reason FROM staff_salary WHERE staff_id=?",
+                                    (sid_staff,))[0]["override_reason"] == "离职折算")
+
+    print("\n== 人员管理：报表与导出 ==")
+    r = c2.get("/staff/report?year=2026")
+    check("人力成本报表可打开", r.status_code == 200 and "人力成本合计".encode() in r.data)
+    # 手工核算：1 月成本 = 实发 3650（覆盖后 3000-50）+ 单位社保 1012 + 公积金 400
+    expected_cost = (300000 - 5000) + (64000 + 32000 + 2000 + 1600 + 1600) + 40000
+    got = db_rows("""SELECT COALESCE(SUM(sal.base + sal.allowance + sal.overtime + sal.subsidy
+        - sal.social_deduct - sal.tax - sal.other_deduct),0) AS net FROM staff_salary sal
+        WHERE sal.year=2026""")[0]["net"]
+    soc = db_rows("""SELECT COALESCE(SUM(co_pension+co_medical+co_unemployment+co_injury+co_maternity),0) AS s,
+        COALESCE(SUM(co_fund),0) AS f FROM staff_social sc WHERE sc.year=2026""")[0]
+    check("年度人力成本与手工核算一致", got + soc["s"] + soc["f"] == expected_cost,
+          "库 %d / 算 %d" % (got + soc["s"] + soc["f"], expected_cost))
+    r = c2.get("/staff/report/salary.csv?year=2026")
+    check("年度工资表 CSV 可导出", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf"))
+    r = c2.get("/staff/report/social.csv?year=2026")
+    check("社保汇总 CSV 可导出", r.status_code == 200)
+
+    print("\n== 人员管理：档案导入与删除保护 ==")
+    staff_csv = ("姓名,性别,出生日期,身份证号,手机号,部门,职位,工作小区,入职日期,合同到期,紧急联系人,紧急电话,现居住址,备注\n"
+                 "员演示,女,1992-02-02,%s,13800009905,保洁,保洁员,阳光花园,2025-01-01,,,,,演示\n"
+                 "坏号码员工,男,,,123,客服,,,,,,,,\n" % good_id_staff).encode("gbk")
+    r = c2.post("/staff/import/preview", data={"file": (io.BytesIO(staff_csv), "员工.csv")},
+                content_type="multipart/form-data")
+    check("员工导入预览（坏行被拦截）", "必须全部修正".encode() in r.data)
+    rows_staff = staff_service_import.read_staff_csv(
+        ("姓名,性别,出生日期,身份证号,手机号,部门,职位,工作小区,入职日期,合同到期,紧急联系人,紧急电话,现居住址,备注\n"
+         "员演示,女,1992-02-02,%s,13800009905,保洁,保洁员,阳光花园,2025-01-01,,,,,演示\n" % good_id_staff).encode("utf-8-sig"))
+    payload = _json.dumps(rows_staff, ensure_ascii=False)
+    r = c2.post("/staff/import/confirm", data={"payload": payload}, follow_redirects=True)
+    check("员工档案导入成功", "导入完成".encode() in r.data)
+    r = c2.get("/staff?keyword=员演示")
+    check("导入的员工可搜索", "员演示".encode() in r.data)
+    r = c2.post("/staff/%d/delete" % sid_staff, follow_redirects=False)
+    check("有工资记录的员工删除被拦截", r.status_code == 302)
+    # 离职员工不出现在批量录入
+    c2.post("/staff/%d/edit" % sid_staff, data={
+        "name": "员测试", "gender": "男", "birth_date": "1985-05-05", "id_number": good_id_staff,
+        "phone": "13800009901", "department": "秩序", "position": "保安队长", "community_id": "1",
+        "hire_date": "2024-03-01", "leave_date": "2026-09-01", "status": "left",
+        "contract_end": "", "cert_name": "", "cert_end": "", "emergency_name": "",
+        "emergency_phone": "", "address": "", "remark": ""}, follow_redirects=True)
+    r = c2.get("/staff/salary?year=2026&month=1")
+    check("离职员工不出现在批量录入名单", "员测试".encode() not in r.data)
+
+    # ============ 15.8 支出管理 ============
+    print("\n== 支出管理 ==")
+    r = c2.get("/expense")
+    check("支出管理页可打开", r.status_code == 200)
+    r = c2.post("/expense/add", data={"exp_date": "2026-01-31", "category": "公共支出",
+                                      "item": "公共电费 2026-01", "amount": "879.09",
+                                      "remark": "测试"}, follow_redirects=True)
+    check("登记公共支出", "公共电费 2026-01".encode() in r.data)
+    n_exp = db_rows("SELECT COUNT(*) AS n FROM expense WHERE item='公共电费 2026-01'")[0]["n"]
+    check("支出落库", n_exp == 1, str(n_exp))
+    r = c2.post("/expense/add", data={"exp_date": "2026-01-31", "category": "物业支出",
+                                      "item": "大扫把", "amount": "50.00"}, follow_redirects=True)
+    r = c2.get("/expense")
+    check("支出列表显示合计", "929.09".encode() in r.data)
+    r = c2.post("/expense/add", data={"exp_date": "2026-01-31", "category": "物业支出",
+                                      "item": "负数测试", "amount": "-5"}, follow_redirects=False)
+    check("负数金额被拦截", r.status_code == 302)
+    eid = db_rows("SELECT id FROM expense WHERE item='负数测试'")
+    check("负数支出未落库", len(eid) == 0)
+    exp_id = db_rows("SELECT id FROM expense WHERE item='大扫把'")[0]["id"]
+    r = c2.post("/expense/%d/delete" % exp_id, follow_redirects=True)
+    check("删除支出", "大扫把".encode() not in r.data)
+    r = c2.get("/expense/export?year=2026")
+    check("支出 CSV 可导出", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf"))
+
+    # ============ 15.9 编辑账期 ============
+    print("\n== 编辑账期 ==")
+    bid_ep = db_rows("""SELECT b.id, b.period FROM bill b
+        WHERE b.status='paid' LIMIT 1""")
+    if bid_ep:
+        old_p = bid_ep[0]["period"]
+        r = c2.post("/fee/bill/%d/edit-period" % bid_ep[0]["id"],
+                    data={"new_period": old_p}, follow_redirects=True)
+        check("相同账期提交被撞期拦截", "不能重复".encode() in r.data)
+        r = c2.post("/fee/bill/%d/edit-period" % bid_ep[0]["id"],
+                    data={"new_period": "2021.7-2021.12.31"}, follow_redirects=True)
+        check("非法格式被拒绝", "格式不正确".encode() in r.data)
+        r = c2.post("/fee/bill/%d/edit-period" % bid_ep[0]["id"],
+                    data={"new_period": "2021.8-2021.12"}, follow_redirects=True)
+        check("账期修改成功", "账期已修改".encode() in r.data)
+        row = db_rows("SELECT period, period_start, months FROM bill WHERE id=?", (bid_ep[0]["id"],))[0]
+        check("账期/起始/月数已更新", row["period"] == "2021.8-2021.12"
+              and row["period_start"] == "2021-08" and row["months"] == 5,
+              str(dict(row)))
+        r = c2.post("/fee/bill/%d/edit-period" % bid_ep[0]["id"],
+                    data={"new_period": old_p}, follow_redirects=True)
+        check("账期改回原值（恢复现场）", "账期已修改".encode() in r.data)
+    else:
+        check("编辑账期（无自定义账期可测，跳过）", True)
+
+    # ============ 16. 所有页面可访问 ============
+    print("\n== 所有页面可访问 ==")
+    pages = ["/", "/community/list", "/community/add", "/house", "/house/add", "/house/batch",
+             "/house/import", "/building", "/house-type", "/resident",
+             "/staff", "/staff/add", "/staff/salary", "/staff/social", "/staff/report",
+             "/expense",
+             "/staff/import", "/staff/%d" % sid_staff, "/staff/%d/edit" % sid_staff, "/resident/add?house_id=%d&role=member" % hid_main,
+             "/fee/items", "/fee/bills", "/fee/generate", "/fee/overdue", "/fee/payments",
+             "/report", "/repair", "/notice", "/settings", "/house/vehicles", "/house/%d" % hid_main,
+             "/house/%d/edit" % hid_main, "/fee/house/%d/payall" % hid_main,
+             "/fee/bill/%d" % bill["id"], "/resident/export"]
+    ok = True
+    for p in pages:
+        r = c2.get(p)
+        if r.status_code != 200:
+            ok = False
+            print("    💥 %s -> %d" % (p, r.status_code))
+    check("全部 %d 个页面返回 200" % len(pages), ok)
+
+    # ============ 18. v2.2.0：账单分页 / 启动密码 / 局域网开关 ============
+    print("\n== 账单分页与全量合计 ==")
+    from services import fee_service as fs22
+    con_p = sqlite3.connect(config.DB_PATH)
+    con_p.row_factory = sqlite3.Row
+    try:
+        total_b = fs22.count_bills(con_p, 1)
+        p1 = fs22.list_bills(con_p, 1, page=1, page_size=5)
+        p2 = fs22.list_bills(con_p, 1, page=2, page_size=5)
+        check("账单分页：count 与每页行数一致", total_b > 0 and len(p1) == 5,
+              "总数 %d / 第1页 %d 行" % (total_b, len(p1)))
+        check("账单分页：两页无重复、并集连续", len({r["id"] for r in p1} | {r["id"] for r in p2}) == 10)
+        stats = fs22.payment_stats(con_p, 1)
+        sql_sum = con_p.execute("""SELECT COALESCE(SUM(p.amount),0) FROM payment p
+            JOIN bill b ON b.id=p.bill_id JOIN house h ON h.id=b.house_id
+            WHERE h.community_id=1""").fetchone()[0]
+        check("流水全量合计与 SQL SUM 一致（不随分页截断）", stats["sum_fen"] == sql_sum,
+              "%s / %s" % (stats["sum_fen"], sql_sum))
+        stats_kw = fs22.payment_stats(con_p, 1, keyword="不存在xyz")
+        check("流水统计支持筛选条件", stats_kw["count"] == 0 and stats_kw["sum_fen"] == 0)
+    finally:
+        con_p.close()
+    r = c2.get("/fee/bills?page=1")
+    check("账单页显示总数与页码", r.status_code == 200 and ("共 %d 笔账单" % total_b).encode() in r.data)
+    r = c2.get("/fee/bills?page=999")
+    check("账单页超范围页码自动收敛不崩溃", r.status_code == 200)
+    r = c2.get("/fee/payments?page=1")
+    check("流水页显示全量笔数与合计", r.status_code == 200 and "共 4 笔流水".encode() in r.data
+          and "455.00".encode() in r.data)
+    r = c2.get("/fee/payments/export")
+    check("流水 CSV 导出仍为全量", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf"))
+
+    print("\n== 会话安全与索引 ==")
+    check("会话 Cookie 显式 SameSite=Lax", app.config.get("SESSION_COOKIE_SAMESITE") == "Lax")
+    idx_names = {r["name"] for r in db_rows("SELECT name FROM sqlite_master WHERE type='index'")}
+    check("报表/流水索引已建立", {"idx_bill_period_start", "idx_payment_bill"} <= idx_names)
+    import utils as _u22
+    check("house_label 工具函数（含 # 清理）",
+          _u22.house_label("1#", 1, 1501) == "1栋1单元1501室"
+          and _u22.house_label("9", 2, 804) == "9栋2单元804室")
+
+    print("\n== 启动密码（WUYE_PIN）==")
+    os.environ["WUYE_PIN"] = "2468"
+    app_pin = create_app()
+    check("启用后实例持有 4 位密码", app_pin.config.get("STARTUP_PIN") == "2468")
+    cpin = app_pin.test_client()
+    r = cpin.get("/")
+    check("未验证前访问首页被拦截到验证页",
+          r.status_code == 302 and "/pin" in r.headers.get("Location", ""),
+          "%s %s" % (r.status_code, r.headers.get("Location")))
+    r = cpin.get("/pin")
+    check("密码验证页可打开", r.status_code == 200 and "4 位数字".encode() in r.data)
+    r = cpin.post("/pin", data={"code": "1111", "next": "/"})
+    check("错误密码提示不通过", r.status_code == 200 and "密码不正确".encode() in r.data)
+    r = cpin.get("/")
+    check("错误密码后仍被拦截", r.status_code == 302 and "/pin" in r.headers.get("Location", ""))
+    r = cpin.post("/pin", data={"code": "2468", "next": "/"}, follow_redirects=True)
+    check("正确密码后进入系统", r.status_code == 200 and "阳光花园".encode() in r.data)
+    r = cpin.get("/house")
+    check("验证通过后会话内不再询问", r.status_code == 200)
+    os.environ.pop("WUYE_PIN", None)
+    app_nopin = create_app()
+    check("未设置 WUYE_PIN 的新实例无密码", app_nopin.config.get("STARTUP_PIN") is None)
+    r = app_nopin.test_client().get("/pin", follow_redirects=False)
+    check("无密码时 /pin 直接跳回首页", r.status_code == 302)
+    check("已启动实例不受环境变量变化影响", app_pin.config.get("STARTUP_PIN") == "2468")
+
+    print("\n== 局域网开关 ==")
+    from app import _bind_host
+    os.environ["WUYE_LAN"] = "1"
+    check("WUYE_LAN=1 时对局域网开放", _bind_host() == "0.0.0.0")
+    os.environ.pop("WUYE_LAN", None)
+    check("默认仅本机可访问", _bind_host() == "127.0.0.1")
+
+    # ============ 19. v2.3.0：预收款 / 账单导出 / 收据打印 / 公告 / 报修照片 ============
+    print("\n== 预收款（多收转预收 / 余额抵扣）==")
+    from services import prepaid_service as _pp
+    con_p2 = sqlite3.connect(config.DB_PATH)
+    con_p2.row_factory = sqlite3.Row
+    try:
+        # ① 手工登记预收 100 元
+        r = c2.post("/house/%d/prepaid/add" % hid_payall,
+                    data={"amount": "100.00", "op_date": TODAY.isoformat(),
+                          "method": "现金", "remark": "提前预存"}, follow_redirects=True)
+        check("手工登记预收 100 元成功", "预收款登记成功".encode() in r.data)
+        check("预收余额入账 100 元",
+              _pp.get_balance(con_p2, hid_payall) == 10000,
+              str(_pp.get_balance(con_p2, hid_payall)))
+        # 负数金额被拦截
+        r = c2.post("/house/%d/prepaid/add" % hid_payall,
+                    data={"amount": "-5", "op_date": TODAY.isoformat()}, follow_redirects=False)
+        check("负数预收被拦截", r.status_code == 302)
+
+        # ② 一键缴清多收自动转预收：hid_main 未缴合计（从库里取），实收 300 元
+        main_bills = db_rows("""SELECT id, amount_receivable - amount_received AS rem
+                                FROM bill WHERE house_id=? AND status IN ('unpaid','partial')""",
+                             (hid_main,))
+        main_ids = [str(b["id"]) for b in main_bills]
+        sum_rem = sum(b["rem"] for b in main_bills)
+        bal0 = _pp.get_balance(con_p2, hid_main)
+        r = c2.post("/fee/house/%d/payall" % hid_main,
+                    data={"bill_ids": main_ids, "total_amount": "300.00",
+                          "pay_date": TODAY.isoformat(), "method": "现金"}, follow_redirects=True)
+        check("多收不再报错，且提示转预收", "自动转入该房屋预收余额".encode() in r.data)
+        n_left = db_rows("SELECT COUNT(*) AS n FROM bill WHERE house_id=? AND status IN ('unpaid','partial')",
+                         (hid_main,))[0]["n"]
+        check("一键缴清后账单全部缴清", n_left == 0, "剩余未缴 %d 笔" % n_left)
+        expect_bal = bal0 + 30000 - sum_rem
+        check("多收部分自动入预收台账（%s 分）" % expect_bal,
+              _pp.get_balance(con_p2, hid_main) == expect_bal,
+              str(_pp.get_balance(con_p2, hid_main)))
+
+        # ③ 用预收余额抵扣：给 hid_payall 插一笔 100 元未缴账单，全额用余额抵
+        con_t2 = sqlite3.connect(config.DB_PATH)
+        con_t2.execute("""INSERT INTO bill (house_id, fee_item_id, period, period_start, months,
+                           amount_receivable, amount_received)
+                          VALUES (?,?,'预收抵扣测试期','2026-01',1,10000,0)""", (hid_payall, f1))
+        con_t2.commit()
+        bid_pd = con_t2.execute("SELECT id FROM bill WHERE period='预收抵扣测试期'").fetchone()[0]
+        con_t2.close()
+        r = c2.post("/fee/house/%d/payall" % hid_payall,
+                    data={"bill_ids": [str(bid_pd)], "total_amount": "0",
+                          "use_prepaid": "1", "pay_date": TODAY.isoformat()}, follow_redirects=True)
+        check("预收余额可抵扣账单（0 元现金）", "已用预收余额抵扣".encode() in r.data)
+        st_pd = db_rows("SELECT status, amount_received FROM bill WHERE id=?", (bid_pd,))[0]
+        check("抵扣后账单已缴清", st_pd["status"] == "paid" and st_pd["amount_received"] == 10000)
+        pm_pd = db_rows("SELECT method FROM payment WHERE bill_id=?", (bid_pd,))
+        check("抵扣生成「预收抵扣」流水", len(pm_pd) == 1 and pm_pd[0]["method"] == "预收抵扣")
+        check("台账同步记负数", _pp.get_balance(con_p2, hid_payall) == 0,
+              str(_pp.get_balance(con_p2, hid_payall)))
+        # ④ 删除预收抵扣流水 → 金额退回预收余额
+        pay_pd = db_rows("SELECT id FROM payment WHERE bill_id=?", (bid_pd,))[0]["id"]
+        c2.post("/fee/payment/%d/delete" % pay_pd, data={"bill_id": str(bid_pd)},
+                follow_redirects=True)
+        st_pd2 = db_rows("SELECT status, amount_received FROM bill WHERE id=?", (bid_pd,))[0]
+        check("删除抵扣流水后账单回退未缴", st_pd2["status"] == "unpaid")
+        check("删除抵扣流水后预收余额退回", _pp.get_balance(con_p2, hid_payall) == 10000,
+              str(_pp.get_balance(con_p2, hid_payall)))
+    finally:
+        con_p2.close()
+
+    print("\n== 账单导出 / 收据打印 / CSV 防注入 ==")
+    r = c2.get("/fee/bills/export")
+    check("账单列表 CSV 可导出", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf"))
+    r = c2.get("/fee/bills/export?status=paid")
+    check("账单导出支持筛选条件", r.status_code == 200)
+    import utils as _u23
+    resp = _u23.csv_response("t.csv", ["a", "b", "c"], [["=1+1", "-5.00", "-abc"]])
+    check("CSV 公式注入被防护（数字负数保留）",
+          b"'=1+1" in resp.data and b"-5.00" in resp.data and b"'-abc" in resp.data,
+          resp.data.decode("utf-8"))
+    check("金额大写：整/零/角分", _u23.money_capital(45500) == "肆佰伍拾伍元整"
+          and _u23.money_capital(100500) == "壹仟零伍元整"
+          and _u23.money_capital(105050) == "壹仟零伍拾元伍角"
+          and _u23.money_capital(100005) == "壹仟元零伍分"
+          and _u23.money_capital(50) == "伍角",
+          "%s|%s|%s" % (_u23.money_capital(45500), _u23.money_capital(100500), _u23.money_capital(50)))
+    pid_rc = db_rows("SELECT id FROM payment ORDER BY id DESC LIMIT 1")[0]["id"]
+    r = c2.get("/fee/receipt?ids=%d" % pid_rc)
+    check("收据打印页可打开（含大写金额）", r.status_code == 200
+          and "收款收据".encode() in r.data and "大写".encode() in r.data)
+
+    print("\n== 公告 ==")
+    r = c2.post("/notice/add", data={"title": "测试公告标题", "content": "内容正文",
+                                     "pinned": "1"}, follow_redirects=True)
+    check("发布公告", "测试公告标题".encode() in r.data)
+    r = c2.get("/")
+    check("总览页显示最新公告", "测试公告标题".encode() in r.data)
+    nid23 = db_rows("SELECT id FROM notice WHERE title='测试公告标题'")[0]["id"]
+    r = c2.post("/notice/%d/delete" % nid23, follow_redirects=True)
+    n_n = db_rows("SELECT COUNT(*) AS n FROM notice WHERE title='测试公告标题'")[0]["n"]
+    check("删除公告", n_n == 0)
+
+    print("\n== 报修照片 ==")
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    r = c2.post("/repair/add", data={"house_id": str(hid_main), "content": "照片测试报修",
+                                     "photo": (io.BytesIO(png), "现场.png")},
+                content_type="multipart/form-data", follow_redirects=True)
+    check("带照片报修登记成功", "报修已登记".encode() in r.data)
+    row_ph = db_rows("SELECT photo_path FROM repair WHERE content='照片测试报修'")[0]["photo_path"]
+    check("照片落盘并记录文件名", bool(row_ph) and row_ph.startswith("repair_"))
+    r = c2.get("/repair")
+    check("报修列表显示照片入口", "📷 查看".encode() in r.data)
+    r = c2.get("/repair/photo/%s" % row_ph)
+    check("照片可查看", r.status_code == 200)
+    r = c2.post("/repair/add", data={"house_id": str(hid_main), "content": "坏照片测试",
+                                     "photo": (io.BytesIO(b"hello"), "x.txt")},
+                content_type="multipart/form-data", follow_redirects=False)
+    check("非图片格式被拦截", r.status_code == 302)
+    r = c2.get("/repair/photo/repair_x.png")
+    check("伪造照片名被拦截", r.status_code == 302)
+    r = c2.get("/")
+    check("总览页本月口径说明显示", "历史导入的跨年账单不计入本月".encode() in r.data)
+
+    # ============ 20. v2.4.0：设置页管理启动密码（启用/修改/关闭） ============
+    # 放在最后：启用持久密码会影响本 app 的所有客户端会话
+    print("\n== 设置页启动密码管理 ==")
+    r = c2.get("/settings")
+    check("设置页显示启动密码卡片（未启用）", "启动密码".encode() in r.data and "未启用".encode() in r.data)
+    r = c2.post("/settings/pin/enable", data={"pin": "12", "pin2": "12"}, follow_redirects=True)
+    check("非 4 位密码被拦截", "4 位数字".encode() in r.data)
+    r = c2.post("/settings/pin/enable", data={"pin": "1357", "pin2": "2468"}, follow_redirects=True)
+    check("两次输入不一致被拦截", "不一致".encode() in r.data)
+    r = c2.post("/settings/pin/enable", data={"pin": "1357", "pin2": "1357"}, follow_redirects=True)
+    check("启用启动密码成功", "启动密码已开启".encode() in r.data)
+    c_pin = app.test_client()
+    rr = c_pin.get("/", follow_redirects=False)
+    check("运行中启用立即生效（新会话被拦截）",
+          rr.status_code == 302 and "/pin" in rr.headers.get("Location", ""))
+    r = c2.post("/pin", data={"code": "1357", "next": "/"}, follow_redirects=True)
+    check("输入正确密码进入系统", r.status_code == 200 and "阳光花园".encode() in r.data)
+    stored_hash = db_rows("SELECT value FROM app_meta WHERE key='startup_pin_hash'")[0]["value"]
+    check("密码只存哈希（PBKDF2，不含明文）", "1357" not in stored_hash and "$" in stored_hash)
+    check("设置页状态变为已启用", "已启用".encode() in c2.get("/settings").data)
+    r = c2.post("/settings/pin/change", data={"old_pin": "9999", "new_pin": "2468", "new_pin2": "2468"},
+                follow_redirects=True)
+    check("旧密码错误时改密码被拦截", "当前密码不正确".encode() in r.data)
+    r = c2.post("/settings/pin/change", data={"old_pin": "1357", "new_pin": "2468", "new_pin2": "2468"},
+                follow_redirects=True)
+    check("修改密码成功", "启动密码已修改".encode() in r.data)
+    c3 = app.test_client()
+    r = c3.get("/", follow_redirects=False)
+    check("新会话被拦截到验证页", r.status_code == 302 and "/pin" in r.headers.get("Location", ""))
+    r = c3.post("/pin", data={"code": "2468", "next": "/"}, follow_redirects=True)
+    check("新密码可进入", r.status_code == 200)
+    c4 = app.test_client()
+    c4.get("/", follow_redirects=False)
+    r = c4.post("/pin", data={"code": "1357", "next": "/"}, follow_redirects=True)
+    check("旧密码已失效", "密码不正确".encode() in r.data)
+    r = c2.post("/settings/pin/disable", data={"old_pin": "1111"}, follow_redirects=True)
+    check("关闭密码时旧密码错误被拦截", "当前密码不正确".encode() in r.data)
+    r = c2.post("/settings/pin/disable", data={"old_pin": "2468"}, follow_redirects=True)
+    check("关闭启动密码成功", "已关闭".encode() in r.data)
+    c5 = app.test_client()
+    check("关闭后新会话无需密码直接进入", c5.get("/").status_code == 200)
+    check("设置页回到未启用状态", "未启用".encode() in c5.get("/settings").data)
+    check("关闭后哈希已清除", len(db_rows("SELECT value FROM app_meta WHERE key='startup_pin_hash'")) == 0)
+
+    # ============ 21. v2.5.0：同名收费项目 + 指定户生成 ============
+    print("\n== 老库迁移：fee_item 允许同名（自包含内存库验证）==")
+    con_m = sqlite3.connect(":memory:")
+    try:
+        con_m.execute("""CREATE TABLE fee_item (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            community_id INTEGER NOT NULL REFERENCES community(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, pricing_mode TEXT DEFAULT 'area', unit_price INTEGER DEFAULT 0,
+            cycle TEXT DEFAULT 'month', enabled INTEGER DEFAULT 1, remark TEXT DEFAULT '',
+            UNIQUE(community_id, name))""")
+        con_m.execute("INSERT INTO fee_item (id, community_id, name, pricing_mode, unit_price, cycle, enabled) "
+                      "VALUES (1, 1, '物业费', 'area', 220, 'month', 1)")
+        from database import ensure_schema as _ensure21
+        _ensure21(con_m)          # 检测到旧 UNIQUE 结构 → 自动重建
+        con_m.execute("INSERT INTO community (id, name) VALUES (1, '迁移测试小区')")
+        con_m.execute("INSERT INTO fee_item (community_id, name, pricing_mode, unit_price, cycle, enabled) "
+                      "VALUES (1, '物业费', 'fixed', 100, 'month', 1)")
+        n_same = con_m.execute("SELECT COUNT(*) FROM fee_item WHERE name='物业费'").fetchone()[0]
+        kept = con_m.execute("SELECT unit_price FROM fee_item WHERE id=1").fetchone()[0]
+        check("旧结构自动重建，同名可并存且原数据保留", n_same == 2 and kept == 220,
+              "同名 %d 个 / 原单价 %s" % (n_same, kept))
+    finally:
+        con_m.close()
+
+    print("\n== 同名项目与完全重复防呆 ==")
+    r = c2.post("/fee/items/add", data={"name": "物业费", "pricing_mode": "area",
+                                        "unit_price": "2.20", "cycle": "month"}, follow_redirects=True)
+    check("名称/方式/周期/单价完全相同被拦截", "无需重复添加".encode() in r.data)
+    r = c2.post("/fee/items/add", data={"name": "物业费", "pricing_mode": "fixed",
+                                        "unit_price": "1.00", "cycle": "month"}, follow_redirects=True)
+    check("同名不同单价的项目可添加", "收费项目已添加".encode() in r.data)
+    f1b = db_rows("SELECT id FROM fee_item WHERE name='物业费' AND pricing_mode='fixed'")[0]["id"]
+
+    print("\n== 指定户生成 ==")
+    h_sel = [str(r["id"]) for r in db_rows(
+        "SELECT id FROM house WHERE community_id=1 ORDER BY id LIMIT 2")]
+    r = c2.post("/fee/generate", data={"fee_item_id": str(f1), "period": "2027-01",
+                                       "building_id": "selected", "status_scope": "all",
+                                       "house_ids": h_sel})
+    check("指定户预览只含勾选的 2 户", "将生成".encode() in r.data and "<b>2</b>".encode() in r.data)
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(f1), "period": "2027-01",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": h_sel}, follow_redirects=True)
+    check("只为勾选的 2 户生成账单", "共 2 笔".encode() in r.data)
+    nxt = __import__("sys").modules["utils"].month_add(CUR_MONTH, 1)   # 末笔覆盖月次月
+    n_p = db_rows("SELECT COUNT(*) AS n FROM bill WHERE house_id IN (%s) AND period_start=? AND months=?"
+                  % ",".join(h_sel), (nxt, 3))[0]["n"]
+    check("两户从末笔覆盖月次月起补齐（3 个月缺口段，共 2 笔）", n_p == 2, str(n_p))
+    r = c2.post("/fee/generate", data={"fee_item_id": str(f1), "period": "2027-02",
+                                       "building_id": "selected", "status_scope": "all",
+                                       "house_ids": []}, follow_redirects=True)
+    check("一户都没勾时给出提示", "没有需要生成的房屋".encode() in r.data)
+
+    print("\n== 每户同账期同名欠费唯一 ==")
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(f1b), "period": "2027-01",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": h_sel[:1]}, follow_redirects=True)
+    check("同名另一项目同账期被排除（不生成）", "没有需要生成的账单".encode() in r.data)
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(f2), "period": "2027-01",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": h_sel[:1]}, follow_redirects=True)
+    check("不同名项目同账期可并存（正常生成）", "共 1 笔".encode() in r.data)
+    # 造一笔 2027-02 的同名账单，尝试改期到 2027-01 → 同名撞期拦截
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(f1b), "period": "2027-02",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": h_sel[:1]}, follow_redirects=True)
+    bid_same = db_rows("SELECT id FROM bill WHERE fee_item_id=? AND period='2027-02'", (f1b,))[0]["id"]
+    dup_target = db_rows("SELECT period FROM bill WHERE house_id=? AND fee_item_id=? AND period!='2027-02' LIMIT 1",
+                         (db_rows("SELECT house_id FROM bill WHERE id=?", (bid_same,))[0]["house_id"], f1))[0]["period"]
+    r = c2.post("/fee/bill/%d/edit-period" % bid_same, data={"new_period": dup_target},
+                follow_redirects=True)
+    check("改账期撞到同名同期账单被拦截", "同名".encode() in r.data)
+
+    # ============ 22. v2.6.0：车牌全局查重 / 停车费关联车辆 / 车辆清单 ============
+    print("\n== 车牌全局查重 ==")
+    veh_a = db_rows("SELECT id, house_id FROM vehicle WHERE plate='京A99999'")[0]
+    r = c2.post("/house/%d/vehicle/add" % hid_main, data={"plate": "京A99999", "vehicle_remark": ""},
+                follow_redirects=True)
+    check("跨房屋重复车牌被拦截并提示现有位置",
+          "已登记在".encode() in r.data and "不能重复登记".encode() in r.data)
+    from services import house_import as _hi26
+    con_i = sqlite3.connect(config.DB_PATH)
+    con_i.row_factory = sqlite3.Row
+    con_i.execute("PRAGMA foreign_keys=ON")
+    try:
+        recs = []
+        for i, room in enumerate((1, 2)):
+            recs.append({"lineno": i + 2, "errors": [], "members": [], "tenants": [],
+                         "vehicles": [{"plate": "京V26880", "remark": "测试车位"}],
+                         "remark": "", "building_code": "26#", "unit": 1, "room_no": room,
+                         "area_100": 0, "parking_no": "", "owner": None})
+        created26 = _hi26.execute_import(con_i, 1, recs)
+        n_plate = con_i.execute("SELECT COUNT(*) FROM vehicle WHERE plate='京V26880'").fetchone()[0]
+        check("名册导入同车牌跨户只登记一次", created26["vehicles"] == 1 and n_plate == 1,
+              "新建 %d / 库内 %d" % (created26["vehicles"], n_plate))
+        con_i.commit()
+    finally:
+        con_i.close()
+
+    print("\n== 生成停车费账单关联车辆 ==")
+    r = c2.post("/fee/generate", data={"fee_item_id": str(fid_park), "period": "2027-03",
+                                       "building_id": "selected", "status_scope": "all",
+                                       "house_ids": [str(hid_imp)],
+                                       "vehicle_for_%s" % hid_imp: str(veh_a["id"])})
+    check("预览页出现关联车辆下拉", "关联车辆".encode() in r.data and "京A99999".encode() in r.data)
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_park), "period": "2027-03",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": [str(hid_imp)],
+                                               "vehicle_for_%s" % hid_imp: str(veh_a["id"])},
+                follow_redirects=True)
+    check("停车费账单生成成功", "共 1 笔".encode() in r.data)
+    vid_set = db_rows("SELECT vehicle_id, months FROM bill WHERE fee_item_id=? AND period='2027.1-2027.3'",
+                      (fid_park,))[0]
+    check("账单已关联所选车辆（2027.1-2027.3，从末笔缴至月次月起 3 个月）",
+          vid_set["vehicle_id"] == veh_a["id"] and vid_set["months"] == 3,
+          str(dict(vid_set)))
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_park), "period": "2027-04",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": [str(hid_imp)]}, follow_redirects=True)
+    vid_none = db_rows("SELECT vehicle_id FROM bill WHERE fee_item_id=? AND period='2027-04'",
+                       (fid_park,))[0]["vehicle_id"]
+    check("不选车辆时账单不关联", vid_none is None, str(vid_none))
+    other_vid = db_rows("SELECT id FROM vehicle WHERE house_id != ?", (hid_imp,))[0]["id"]
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_park), "period": "2027-05",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": [str(hid_imp)],
+                                               "vehicle_for_%s" % hid_imp: str(other_vid)},
+                follow_redirects=True)
+    check("关联车辆与房屋不匹配被拦截", "不匹配".encode() in r.data)
+    n_05 = db_rows("SELECT COUNT(*) AS n FROM bill WHERE period='2027-05'")[0]["n"]
+    check("不匹配时未生成账单", n_05 == 0, str(n_05))
+
+    print("\n== 车辆清单页与导出 ==")
+    r = c2.get("/house/vehicles")
+    check("车辆清单页可打开", r.status_code == 200 and "京A99999".encode() in r.data)
+    r = c2.get("/house/vehicles?keyword=京A99999")
+    check("按车牌搜索车辆", r.status_code == 200 and "京A99999".encode() in r.data)
+    r = c2.get("/house/vehicles/export")
+    check("车辆清单 CSV 可导出", r.status_code == 200 and r.data.startswith(b"\xef\xbb\xbf")
+          and "京A99999".encode() in r.data)
+
+    # ============ 23. v2.6.1：账期覆盖核对（自动跳过/缺口补齐） ============
+    print("\n== 账期覆盖核对 ==")
+    c2.post("/fee/items/add", data={"name": "年费测试", "pricing_mode": "fixed",
+                                    "unit_price": "100", "cycle": "year"}, follow_redirects=True)
+    fid_y = db_rows("SELECT id FROM fee_item WHERE name='年费测试'")[0]["id"]
+    hs_all = [str(r["id"]) for r in db_rows("SELECT id FROM house WHERE community_id=1 ORDER BY id")]
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_y), "period": "2026",
+                                               "building_id": "", "status_scope": "all"},
+                follow_redirects=True)
+    check("2026 全量生成", "共 %d 笔" % len(hs_all) in r.data.decode("utf-8"))
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_y), "period": "2026",
+                                               "building_id": "", "status_scope": "all"},
+                follow_redirects=True)
+    check("已覆盖期间再次生成被整批跳过", "没有需要生成的账单".encode() in r.data)
+    # 给第一户手工插入 2027.1-2027.6 已缴账单（模拟表内先缴了半年）
+    hid_1 = int(hs_all[0])
+    con_y = sqlite3.connect(config.DB_PATH)
+    con_y.execute("""INSERT INTO bill (house_id, fee_item_id, period, period_start, months,
+                       amount_receivable, amount_received, status)
+                     VALUES (?,?,'2027.1-2027.6','2027-01',6,60000,60000,'paid')""", (hid_1, fid_y))
+    con_y.commit()
+    con_y.close()
+    r = c2.post("/fee/generate", data={"fee_item_id": str(fid_y), "period": "2027",
+                                       "building_id": "", "status_scope": "all"})
+    check("预览提示自动补齐缺口", "自动补齐缺口 1 笔".encode() in r.data
+          and "2027.7-2027.12".encode() in r.data)
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_y), "period": "2027",
+                                               "building_id": "", "status_scope": "all"},
+                follow_redirects=True)
+    check("2027 生成成功（该户补齐 1 笔 + 其余整年）", "共 %d 笔" % len(hs_all) in r.data.decode("utf-8"))
+    seg = db_rows("""SELECT period, months, amount_receivable FROM bill
+                     WHERE fee_item_id=? AND house_id=? AND period LIKE '2027%'""", (fid_y, hid_1))
+    seg_new = [x for x in seg if x["period"] == "2027.7-2027.12"]
+    check("缺口段为 2027.7-2027.12（6 个月 600 元）",
+          len(seg) == 2 and seg_new and seg_new[0]["months"] == 6
+          and seg_new[0]["amount_receivable"] == 60000,
+          str([dict(x) for x in seg]))
+    n_full = db_rows("SELECT COUNT(*) AS n FROM bill WHERE fee_item_id=? AND period='2027' AND months=12",
+                     (fid_y,))[0]["n"]
+    check("其余房屋仍为整年账单", n_full == len(hs_all) - 1, str(n_full))
+    # 未缴清的已生成账单同样算覆盖
+    hid_2 = int(hs_all[1])
+    con_y = sqlite3.connect(config.DB_PATH)
+    con_y.execute("""INSERT INTO bill (house_id, fee_item_id, period, period_start, months,
+                       amount_receivable, amount_received, status)
+                     VALUES (?,?,'2028.1-2028.12','2028-01',12,120000,0,'unpaid')""", (hid_2, fid_y))
+    con_y.commit()
+    con_y.close()
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_y), "period": "2028",
+                                               "building_id": "", "status_scope": "all"},
+                follow_redirects=True)
+    check("未缴清的已有账单同样算覆盖（跳过该户）",
+          "共 %d 笔" % (len(hs_all) - 1) in r.data.decode("utf-8"))
+    # period_start 为单位月份（'2028-2'，历史导入缺陷格式）也应参与覆盖判定
+    hid_3 = int(hs_all[2])
+    con_y = sqlite3.connect(config.DB_PATH)
+    con_y.execute("INSERT INTO bill (house_id, fee_item_id, period, period_start, months, amount_receivable, amount_received, status) VALUES (?,?,?,?,?,?,?,?)",
+                  (hid_3, fid_y, "2028.2-2029.1", "2028-2", 12, 120000, 0, "unpaid"))
+    con_y.commit()
+    con_y.close()
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_y), "period": "2029",
+                                               "building_id": "", "status_scope": "all"},
+                follow_redirects=True)
+    seg3 = db_rows("SELECT period, months FROM bill WHERE fee_item_id=? AND house_id=? AND period LIKE '2029%'",
+                   (fid_y, hid_3))
+    check("单位月份 period_start 也算覆盖（该户只补 2029.2-2029.12）",
+          len(seg3) == 1 and seg3[0]["period"] == "2029.2-2029.12" and seg3[0]["months"] == 11,
+          str([dict(x) for x in seg3]))
+    n_29 = db_rows("SELECT COUNT(*) AS n FROM bill WHERE fee_item_id=? AND period='2029' AND months=12",
+                   (fid_y,))[0]["n"]
+    check("其余房屋 2029 仍为整年", n_29 == len(hs_all) - 1, str(n_29))
+
+    # ============ 24. v2.7.0：计费开始月份 + 接管起补 ============
+    print("== 计费开始月份与接管起补 ==")
+    r = c2.post("/community/billing-start", data={"billing_start": "2025-07"}, follow_redirects=True)
+    check("总览页设置计费开始月份", "计费开始月份已保存".encode() in r.data)
+    r = c2.get("/")
+    check("总览显示计费开始月份", "2025-07".encode() in r.data)
+    r = c2.post("/community/billing-start", data={"billing_start": "abc"}, follow_redirects=True)
+    check("非法月份被拦截", "格式应为 年-月".encode() in r.data)
+    r = c2.post("/house/add", data={"building_id": "1", "unit": "1", "floor": "5", "room_no": "599",
+                                    "status": "self", "owner_mode": "none"}, follow_redirects=True)
+    check("新增一套无账单房屋", r.status_code == 200)
+    hid_new = db_rows("SELECT id FROM house WHERE room_no=599")[0]["id"]
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(fid_y), "period": "2026",
+                                               "building_id": "", "status_scope": "all"},
+                follow_redirects=True)
+    check("从未开单的新户从计费开始月起补（仅生成 1 笔）",
+          "共 1 笔" in r.data.decode("utf-8"))
+    seg = db_rows("SELECT period, months, amount_receivable FROM bill WHERE fee_item_id=? AND house_id=?",
+                  (fid_y, hid_new))
+    check("新户补齐账期 2025.7-2026.12（18 个月 1800 元）",
+          seg and seg[0]["period"] == "2025.7-2026.12" and seg[0]["months"] == 18
+          and seg[0]["amount_receivable"] == 180000,
+          str([dict(x) for x in seg]))
+    n_skip = db_rows("SELECT COUNT(*) AS n FROM bill WHERE fee_item_id=? AND house_id=? AND period LIKE '2025.7%'",
+                     (fid_y, int(hs_all[0])))[0]["n"]
+    check("已预缴到账期之后的房屋自动跳过（不再生成 2025.7 起的账单）", n_skip == 0, str(n_skip))
+
+    # ============ 26. v2.9.0：体验审查修复回归 ============
+    print("== 零元免收档 UI 创建 / 多联收据 / 预览业主列 ==")
+    c2.post("/fee/items/add", data={"name": "免收测试2", "pricing_mode": "fixed",
+                                    "unit_price": "0", "cycle": "month"}, follow_redirects=True)
+    f_free = db_rows("SELECT id FROM fee_item WHERE name='免收测试2'")
+    check("UI 可创建 0 元免收档项目", bool(f_free))
+    # 预览业主列（F-4）：给 102 室登记业主后预览应显示业主名
+    from utils import month_add as _ma
+    nxt = _ma(CUR_MONTH, 1)
+    r = c2.post("/resident/add", data={"house_id": str(hid_new), "role": "owner", "name": "档位业主",
+                                        "relation": ""}, follow_redirects=True)
+    r = c2.post("/fee/generate", data={"fee_item_id": str(f1), "period": nxt,
+                                        "building_id": "selected", "status_scope": "all",
+                                        "house_ids": [str(hid_new)]})
+    check("生成预览显示业主列", "档位业主".encode() in r.data)
+    # 多联收据（F-2）：ids 重复参数提交应渲染两联
+    pid_a = db_rows("SELECT id FROM payment ORDER BY id DESC LIMIT 1")[0]["id"]
+    pid_b = db_rows("SELECT id FROM payment ORDER BY id DESC LIMIT 1 OFFSET 1")[0]["id"]
+    r = c2.get("/fee/receipt?ids=%d&ids=%d" % (pid_a, pid_b))
+    check("收据多选渲染两联", r.status_code == 200 and "第 2 联".encode() in r.data)
+
+    # ============ 25. v2.7.1：本户物业费档位 ============
+    print("== 本户物业费档位 ==")
+    r = c2.post("/house/%d/edit" % hid_new, data={"building_id": "1", "unit": "1", "floor": "5",
+                                                  "room_no": "599", "status": "self",
+                                                  "owner_mode": "none", "fee_item_id": str(f1b)},
+                follow_redirects=True)
+    check("房屋编辑设置本户档位", r.status_code == 200)
+    r = c2.get("/house/%d" % hid_new)
+    check("详情页显示档位单价", "1.00".encode() in r.data and "物业费档位".encode() in r.data)
+    r = c2.post("/fee/generate", data={"fee_item_id": str(f1), "period": "2027-06",
+                                       "building_id": "selected", "status_scope": "all",
+                                       "house_ids": [str(hid_new)]})
+    check("预览显示本户档位单价（1.00 而非所选项目价，含接管起补 24 个月）",
+          "本户档位".encode() in r.data and "1.00".encode() in r.data
+          and "2025.7-2027.6".encode() in r.data)
+    r = c2.post("/fee/generate/confirm", data={"fee_item_id": str(f1), "period": "2027-06",
+                                               "building_id": "selected", "status_scope": "all",
+                                               "house_ids": [str(hid_new)]}, follow_redirects=True)
+    b_tier = db_rows("SELECT fee_item_id, amount_receivable, months FROM bill WHERE fee_item_id=? AND house_id=?",
+                     (f1b, hid_new))
+    check("账单按本户档位项目入账（1.00 元/月 × 24 个月 = 24 元）",
+          b_tier and b_tier[0]["amount_receivable"] == 2400 and b_tier[0]["months"] == 24,
+          str([dict(x) for x in b_tier]))
+    # 非法档位被拦截
+    r = c2.post("/house/%d/edit" % hid_new, data={"building_id": "1", "unit": "1", "floor": "5",
+                                                  "room_no": "599", "status": "self",
+                                                  "owner_mode": "none", "fee_item_id": "99999"},
+                follow_redirects=False)
+    check("非法档位被拦截", r.status_code == 302)
+
+    # ================================================== 15. 局域网同步 API（v2.9.1）
+    print("\n===== 15. 局域网同步 API =====")
+    r = c.get("/sync/info")
+    info_before = r.get_json()
+    check("sync/info 未设密码时放行并返回摘要",
+          r.status_code == 200 and info_before.get("ok") is True
+          and info_before.get("bills") is not None)
+
+    r = c.get("/sync/pull")
+    check("sync/pull 返回 SQLite 快照",
+          r.status_code == 200 and r.data[:15] == b"SQLite format 3")
+    pulled = r.data
+
+    tmp_push = os.path.join(tempfile.gettempdir(), "wuye_smoke_push.db")
+    with open(tmp_push, "wb") as f:
+        f.write(pulled)
+    con = sqlite3.connect(tmp_push)
+    con.execute("INSERT INTO community (name) VALUES ('同步测试小区')")
+    con.commit()
+    con.close()
+    backups_before = len([f for f in os.listdir(config.BACKUP_DIR) if f.endswith(".db")])
+    with open(tmp_push, "rb") as f:
+        body = f.read()
+    r = c.post("/sync/push", data=body, content_type="application/octet-stream")
+    check("sync/push 接收合法库", r.status_code == 200 and r.get_json().get("ok") is True)
+    r = c.get("/sync/info")
+    check("推送后小区数 +1", r.get_json().get("communities") == info_before.get("communities") + 1,
+          "before=%s after=%s" % (info_before.get("communities"), r.get_json().get("communities")))
+    backups_after = len([f for f in os.listdir(config.BACKUP_DIR) if f.endswith(".db")])
+    check("推送前旧数据自动备份", backups_after == backups_before + 1)
+
+    r = c.post("/sync/push", data=b"not a database", content_type="application/octet-stream")
+    check("推送非法内容被 400 拒绝", r.status_code == 400)
+
+    # ---- 启动密码下的头部鉴权 ----
+    c.post("/settings/pin/enable", data={"pin": "8848", "pin2": "8848"})
+    r = c.get("/sync/info")
+    check("设密码后无头被 401 拒绝", r.status_code == 401)
+    r = c.get("/sync/info", headers={"X-Wuye-Pin": "0000"})
+    check("密码错误被 401 拒绝", r.status_code == 401)
+    r = c.get("/sync/info", headers={"X-Wuye-Pin": "8848"})
+    check("密码正确放行", r.status_code == 200)
+    r = c.post("/sync/push", data=body, headers={"X-Wuye-Pin": "8848"},
+               content_type="application/octet-stream")
+    check("推送同样要求头部", r.status_code == 200)
+    c.post("/settings/pin/disable", data={"old_pin": "8848"})
+    r = c.get("/sync/info")
+    check("关密码后恢复放行", r.status_code == 200)
+
+    print("\n" + "=" * 50)
+    print("通过 %d 项检查，失败 %d 项" % (PASS, len(FAIL)))
+    for name, detail in FAIL:
+        print("  ❌ %s  %s" % (name, detail))
+    return 0 if not FAIL else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        traceback.print_exc()
+        sys.exit(2)
