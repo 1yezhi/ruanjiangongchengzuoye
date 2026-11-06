@@ -234,7 +234,11 @@ a:hover { color: var(--app-accent-dark); }
 
 /* 待办卡片：固定高度，内部滚动，避免被最长列表拉伸出大片空白 */
 .todo-card { max-height: 276px; display: flex; flex-direction: column; }
-.todo-card .card-body { overflow-y: auto; }
+.todo-card .card-body {
+  overflow-y: auto;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent 100%);
+}
 .todo-card .card-body::-webkit-scrollbar { width: 6px; }
 .todo-card .card-body::-webkit-scrollbar-thumb { background: #dde3ea; border: 0; border-radius: 6px; }
 
